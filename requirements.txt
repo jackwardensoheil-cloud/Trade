@@ -1,5 +1,7 @@
 google-generativeai
 pydantic
 python-telegram-bot
+aiohttp
+
 
 
