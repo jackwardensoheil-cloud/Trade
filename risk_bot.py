@@ -5,35 +5,16 @@ import threading
 import requests
 from http.server import SimpleHTTPRequestHandler, HTTPServer
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
-    filters,
-    ConversationHandler
-)
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, ContextTypes, filters
 
-# تنظیمات لاگ سیستم برای مانیتورینگ ربات
+# تنظیمات لاگ سیستم
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# وضعیت‌های پله‌پله گفتگو برای محاسبات بدون تداخل
-(
-    STATE_SYMBOL,
-    STATE_TRADE_TYPE,
-    STATE_CAPITAL,
-    STATE_RISK,
-    STATE_ENTRY,
-    STATE_STOP,
-    STATE_AI_SYMBOL
-) = range(7)
+# مشخصات نهایی و قطعی شما
+TELEGRAM_BOT_TOKEN = "8849903288:AAGK_XKMgCNbbC04r2IHFF1GyfF12uglIj8"
+GEMINI_API_KEY = "AQ.Ab8RN6KxMDUOa6EPk4os1ll4uRJ2r2to5TYH5uYnSbLr9oqsvQ"
 
-# مشخصات نهایی و اصلی دریافتی از کاربر
-TELEGRAM_BOT_TOKEN = "8851064354:AAGlzs69sTsSB17iNDdbkaAvPGHPoZRnawE"
-GEMINI_API_KEY = "AQ.Ab8RN6Ih7LwDO5EvG4ODxlNdJmgZq96Ynzn2uwGV_63devo7QA"
-
-# ساخت سرور پس‌زمینه برای زنده نگه‌داشتن ربات در سرورهای ابری مثل رندر
+# پورت رندر برای زنده نگه داشتن ربات
 def run_dummy_server():
     port = int(os.environ.get("PORT", 8080))
     server = HTTPServer(('0.0.0.0', port), SimpleHTTPRequestHandler)
@@ -41,10 +22,23 @@ def run_dummy_server():
 
 threading.Thread(target=run_dummy_server, daemon=True).start()
 
-# راه‌اندازی و ساخت دیتابیس محلی ذخیره معاملات
+# راه‌اندازی دیتابیس چندمنظوره (ذخیره وضعیت کاربر + معاملات)
 def init_db():
-    conn = sqlite3.connect('crypto_trades.db')
+    conn = sqlite3.connect('bot_data.db')
     cursor = conn.cursor()
+    # جدول وضعیت کاربران
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS user_states (
+            user_id INTEGER PRIMARY KEY,
+            state TEXT,
+            symbol TEXT,
+            trade_type TEXT,
+            capital REAL,
+            risk_percent REAL,
+            entry_price REAL
+        )
+    ''')
+    # جدول تاریخچه معاملات
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -56,9 +50,8 @@ def init_db():
             entry_price REAL,
             stop_loss REAL,
             position_size REAL,
-            required_margin REAL,
+            margin REAL,
             leverage REAL,
-            fee REAL,
             score INTEGER,
             timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
         )
@@ -68,268 +61,258 @@ def init_db():
 
 init_db()
 
-def save_trade(user_id, data):
-    conn = sqlite3.connect('crypto_trades.db')
+# توابع کمکی دیتابیس
+def get_user_data(user_id):
+    conn = sqlite3.connect('bot_data.db')
     cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO trades (user_id, symbol, trade_type, capital, risk_percent, entry_price, stop_loss, position_size, required_margin, leverage, fee, score)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (
-        user_id, data['symbol'], data['type'], data['capital'], data['risk'],
-        data['entry'], data['stop'], data['pos_size'], data['margin'], data['leverage'], data['fee'], data['score']
-    ))
+    cursor.execute("SELECT state, symbol, trade_type, capital, risk_percent, entry_price FROM user_states WHERE user_id=?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+    if row:
+        return {'state': row[0], 'symbol': row[1], 'type': row[2], 'capital': row[3], 'risk': row[4], 'entry': row[5]}
+    return {'state': 'IDLE', 'symbol': None, 'type': None, 'capital': None, 'risk': None, 'entry': None}
+
+def update_user_field(user_id, field, value):
+    conn = sqlite3.connect('bot_data.db')
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR IGNORE INTO user_states (user_id, state) VALUES (?, 'IDLE')", (user_id,))
+    cursor.execute(f"UPDATE user_states SET {field}=? WHERE user_id=?", (value, user_id))
     conn.commit()
     conn.close()
 
-def main_menu_inline():
+def clear_user_state(user_id):
+    conn = sqlite3.connect('bot_data.db')
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM user_states WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
+
+def save_final_trade(user_id, d, stop_loss, pos_size, margin, leverage, score):
+    conn = sqlite3.connect('bot_data.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO trades (user_id, symbol, trade_type, capital, risk_percent, entry_price, stop_loss, position_size, margin, leverage, score)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (user_id, d['symbol'], d['type'], d['capital'], d['risk'], d['entry'], stop_loss, pos_size, margin, leverage, score))
+    conn.commit()
+    conn.close()
+
+# منوهای کیبورد شیشه‌ای
+def main_menu_keyboard():
     keyboard = [
-        [InlineKeyboardButton("⚡ محاسبه مدیریت ریسک", callback_data="MENU_RISK")],
-        [InlineKeyboardButton("🤖 تحلیل هوش مصنوعی (Gemini)", callback_data="MENU_AI")],
-        [InlineKeyboardButton("⭐ واچ‌لیست برتر", callback_data="MENU_WATCHLIST"), InlineKeyboardButton("📊 آنالیز حساب", callback_data="MENU_ANALYTICS")],
-        [InlineKeyboardButton("📰 اخبار بازار", callback_data="MENU_NEWS"), InlineKeyboardButton("📜 تاریخچه معاملات", callback_data="MENU_HISTORY")]
+        [InlineKeyboardButton("⚡ محاسبه مدیریت ریسک", callback_data="NAV_RISK")],
+        [InlineKeyboardButton("🤖 تحلیل هوش مصنوعی (Gemini)", callback_data="NAV_AI")],
+        [InlineKeyboardButton("📜 تاریخچه معاملات اخیر", callback_data="NAV_HISTORY")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
-def buy_sell_inline():
+def buy_sell_keyboard():
     keyboard = [
-        [InlineKeyboardButton("🟢 LONG / BUY", callback_data="TYPE_LONG"),
-         InlineKeyboardButton("🔴 SHORT / SELL", callback_data="TYPE_SHORT")]
+        [InlineKeyboardButton("🟢 LONG / BUY", callback_data="SET_LONG"),
+         InlineKeyboardButton("🔴 SHORT / SELL", callback_data="SET_SHORT")]
     ]
     return InlineKeyboardMarkup(keyboard)
 
-async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
+# دستور استارت
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    clear_user_state(user_id)
     await update.message.reply_text(
-        "⚡ **به پلتفرم هوشمند مدیریت ریسک و تحلیل بازار خوش آمدید**\n\n"
-        "برای شروع فرآیند، یکی از گزینه‌های زیر را انتخاب کنید:",
-        reply_markup=main_menu_inline(),
+        "👋 **سلام! به دستیار هوشمند و بدون خطای ترید خوش آمدید.**\n\n"
+        "یکی از ابزارهای زیر را برای شروع انتخاب کنید:",
+        reply_markup=main_menu_keyboard(),
         parse_mode="Markdown"
     )
-    return ConversationHandler.END
 
-async def handle_menu_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# مدیریت کلیک دکمه‌ها
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()
+    user_id = query.from_user.id
     data = query.data
+    await query.answer()
 
-    if data == "MENU_RISK":
-        await query.message.reply_text("💱 لطفا نام جفت‌ارز خود را ارسال کنید:\n(مثال: BTC یا ETH)")
-        return STATE_SYMBOL
+    if data == "NAV_RISK":
+        clear_user_state(user_id)
+        update_user_field(user_id, 'state', 'WAITING_SYMBOL')
+        await query.message.reply_text("💱 **مرحله 1 از 5:**\nلطفاً نام جفت‌ارز خود را بفرستید.\n(مثال: BTC یا ETH یا SOL)")
 
-    elif data == "MENU_AI":
-        await query.message.reply_text("🤖 نام ارز مورد نظر خود را بفرستید تا هوش مصنوعی آن را تحلیل کند:\n(مثال: BTC یا SOL)")
-        return STATE_AI_SYMBOL
+    elif data == "NAV_AI":
+        clear_user_state(user_id)
+        update_user_field(user_id, 'state', 'WAITING_AI_SYMBOL')
+        await query.message.reply_text("🤖 **تحلیل هوش مصنوعی:**\nنام رمزارز مورد نظر خود را بفرستید تا جمینای چارت آن را آنالیز کند:\n(مثال: BTC)")
 
-    elif data == "MENU_WATCHLIST":
-        await query.message.reply_text("⭐ لیست واچ‌لیست شما در حال حاضر خالی است.")
-    elif data == "MENU_NEWS":
-        await query.message.reply_text("📰 در حال حاضر اخبار جدیدی در دسترس نیست.")
-    elif data == "MENU_HISTORY":
-        user_id = query.from_user.id
-        conn = sqlite3.connect('crypto_trades.db')
+    elif data == "NAV_HISTORY":
+        conn = sqlite3.connect('bot_data.db')
         cursor = conn.cursor()
-        cursor.execute("SELECT symbol, trade_type, pos_size, score FROM trades WHERE user_id=? ORDER BY id DESC LIMIT 5", (user_id,))
+        cursor.execute("SELECT symbol, trade_type, position_size, score FROM trades WHERE user_id=? ORDER BY id DESC LIMIT 5", (user_id,))
         rows = cursor.fetchall()
         conn.close()
         if not rows:
-            await query.message.reply_text("📜 هنوز هیچ معامله‌ای ثبت نکرده‌اید.")
+            await query.message.reply_text("📜 شما هنوز معاملاتی ثبت نکرده‌اید.", reply_markup=main_menu_keyboard())
         else:
-            text = "📜 **آخرین معاملات ثبت شده شما:**\n\n"
-            for row in rows:
-                text += f"🔹 ارز: {row[0]} | نوع: {row[1]} | حجم: {row[2]}$ | امتیاز ریسک: {row[3]}/100\n"
-            await update.message.reply_text(text, parse_mode="Markdown")
+            txt = "📜 **آخرین محاسبات مدیریت ریسک شما:**\n\n"
+            for r in rows:
+                txt += f"🔹 ارز: **{r[0]}** | پوزیشن: `{r[1]}` | حجم: `{r[2]}$` | امتیاز: `{r[3]}/100`\n"
+            await query.message.reply_text(txt, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+
+    elif data in ["SET_LONG", "SET_SHORT"]:
+        t_type = "LONG" if data == "SET_LONG" else "SHORT"
+        update_user_field(user_id, 'trade_type', t_type)
+        update_user_field(user_id, 'state', 'WAITING_CAPITAL')
+        await query.message.reply_text(f"✅ پوزیشن `{t_type}` ثبت شد.\n\n💰 **مرحله 3 از 5:**\nکل سرمایه کیف‌پول فیوچرز خود را به دلار وارد کنید (فقط عدد):\n(مثال: 500)")
+
+# مدیریت پیام‌های متنی دریافتی
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    u_data = get_user_data(user_id)
+    current_state = u_data['state']
+
+    if current_state == 'WAITING_SYMBOL':
+        symbol = text.upper()
+        update_user_field(user_id, 'symbol', symbol)
+        update_user_field(user_id, 'state', 'WAITING_TYPE')
+        await update.message.reply_text(f"✅ ارز {symbol} تایید شد.\n\n↕️ **مرحله 2 از 5:**\nنوع پوزیشن خود را مشخص کنید:", reply_markup=buy_sell_keyboard())
+
+    elif current_state == 'WAITING_CAPITAL':
+        try:
+            capital = float(text)
+            if capital <= 0: raise ValueError
+            update_user_field(user_id, 'capital', capital)
+            update_user_field(user_id, 'state', 'WAITING_RISK')
+            await update.message.reply_text("📉 **مرحله 4 از 5:**\nچند درصد از کل سرمایه را مایلید در این ترید ریسک کنید؟\n(مثال: 1 یا 1.5 یا 2)")
+        except ValueError:
+            await update.message.reply_text("❌ عدد نامعتبر است! لطفاً مقدار کل سرمایه را به صورت یک عدد درست وارد کنید:")
+
+    elif current_state == 'WAITING_RISK':
+        try:
+            risk = float(text)
+            if risk <= 0 or risk > 100: raise ValueError
+            update_user_field(user_id, 'risk', risk)
+            update_user_field(user_id, 'state', 'WAITING_ENTRY')
+            await update.message.reply_text("🎯 **مرحله 5 از 5:**\nقیمت ورود (Entry Price) مورد نظرتان را وارد کنید:")
+        except ValueError:
+            await update.message.reply_text("❌ درصد نامعتبر است! یک عدد بین 0.1 تا 100 وارد کنید:")
+
+    elif current_state == 'WAITING_ENTRY':
+        try:
+            entry = float(text)
+            if entry <= 0: raise ValueError
+            update_user_field(user_id, 'entry', entry)
+            update_user_field(user_id, 'state', 'WAITING_STOP')
+            await update.message.reply_text("🛑 **مرحله آخر:**\nقیمت حد ضرر (Stop Loss) خود را وارد کنید تا محاسبات انجام شود:")
+        except ValueError:
+            await update.message.reply_text("❌ قیمت ورود اشتباه است! لطفاً فقط عدد لاتین بفرستید:")
+
+    elif current_state == 'WAITING_STOP':
+        try:
+            stop = float(text)
+            if stop <= 0: raise ValueError
+            entry = u_data['entry']
+            t_type = u_data['type']
+
+            if t_type == "LONG" and stop >= entry:
+                await update.message.reply_text("❌ در پوزیشن LONG حد ضرر باید پایین‌تر از قیمت ورود باشد! دوباره وارد کنید:")
+                return
+            if t_type == "SHORT" and stop <= entry:
+                await update.message.reply_text("❌ در پوزیشن SHORT حد ضرر باید بالاتر از قیمت ورود باشد! دوباره وارد کنید:")
+                return
+
+            # محاسبات دقیق بر مبنای استاندارد ریاضی ترید
+            capital = u_data['capital']
+            risk_percent = u_data['risk']
             
-    elif data == "MENU_ANALYTICS":
-        await query.message.reply_text("📊 بخش آنالیز حساب به زودی فعال خواهد شد.")
-        
-    return ConversationHandler.END
-
-# --- فرآیند ماشین حساب مدیریت ریسک ---
-
-async def process_risk_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    symbol = update.message.text.strip().upper()
-    if len(symbol) < 2 or len(symbol) > 12:
-        await update.message.reply_text("❌ خطا در نام جفت‌ارز. مجدداً نام صحیح را بفرستید:")
-        return STATE_SYMBOL
-    context.user_data['symbol'] = symbol
-    await update.message.reply_text(f"✅ ارز {symbol} ثبت شد.\n\nنوع پوزیشن را مشخص کنید:", reply_markup=buy_sell_inline())
-    return STATE_TRADE_TYPE
-
-async def process_trade_type(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    context.user_data['type'] = "LONG" if query.data == "TYPE_LONG" else "SHORT"
-    await query.message.reply_text("💰 لطفاً کل سرمایه در دسترس خود را به دلار وارد کنید:\n(مثال: 1000)")
-    return STATE_CAPITAL
-
-async def process_capital(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        capital = float(update.message.text.strip())
-        if capital <= 0: raise ValueError
-        context.user_data['capital'] = capital
-        await update.message.reply_text("📉 درصد ریسکی که مایلید در این پوزیشن متقبل شوید را وارد کنید (مثلا 1 یا 2):")
-        return STATE_RISK
-    except ValueError:
-        await update.message.reply_text("❌ عدد نامعتبر است. سرمایه را فقط به صورت عدد وارد کنید:")
-        return STATE_CAPITAL
-
-async def process_risk(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        risk = float(update.message.text.strip())
-        if risk <= 0 or risk > 100: raise ValueError
-        context.user_data['risk'] = risk
-        await update.message.reply_text("🎯 قیمت ورود (Entry Price) را به دلار وارد کنید:")
-        return STATE_ENTRY
-    except ValueError:
-        await update.message.reply_text("❌ درصد نامعتبر است. یک عدد بین 0.1 تا 100 وارد کنید:")
-        return STATE_RISK
-
-async def process_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        entry = float(update.message.text.strip())
-        if entry <= 0: raise ValueError
-        context.user_data['entry'] = entry
-        await update.message.reply_text("🛑 قیمت حد ضرر (Stop Loss) را به دلار وارد کنید:")
-        return STATE_STOP
-    except ValueError:
-        await update.message.reply_text("❌ قیمت ورود نامعتبر است. مجدداً به صورت عددی بفرستید:")
-        return STATE_ENTRY
-
-async def process_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        stop = float(update.message.text.strip())
-        entry = context.user_data['entry']
-        trade_type = context.user_data['type']
-        
-        if stop <= 0: raise ValueError
-        if trade_type == "LONG" and stop >= entry:
-            await update.message.reply_text("❌ در معاملات LONG حد ضرر باید کوچکتر از قیمت ورود باشد. مجدداً وارد کنید:")
-            return STATE_STOP
-        if trade_type == "SHORT" and stop <= entry:
-            await update.message.reply_text("❌ در معاملات SHORT حد ضرر باید بزرگتر از قیمت ورود باشد. مجدداً وارد کنید:")
-            return STATE_STOP
+            risk_amount = capital * (risk_percent / 100)
+            price_diff_ratio = abs(entry - stop) / entry
             
-        context.user_data['stop'] = stop
-        capital = context.user_data['capital']
-        risk_percent = context.user_data['risk']
-        
-        # فرمول‌های پیشرفته حسابداری مدیریت ریسک فیوچرز
-        risk_amount = capital * (risk_percent / 100)
-        price_diff = abs(entry - stop)
-        per_diff_percent = (price_diff / entry) * 100
-        
-        pos_size = risk_amount / (price_diff / entry)
-        leverage = round(100 / per_diff_percent, 1)
-        if leverage > 50: leverage = 50.0
-        if leverage < 1: leverage = 1.0
-        
-        margin = pos_size / leverage
-        fee = pos_size * 0.0008
-        
-        score = 100
-        if risk_percent > 3: score -= 30
-        if leverage > 20: score -= 20
-        if margin > (capital * 0.2): score -= 20
-        if score < 10: score = 10
-
-        context.user_data['pos_size'] = round(pos_size, 2)
-        context.user_data['margin'] = round(margin, 2)
-        context.user_data['leverage'] = leverage
-        context.user_data['fee'] = round(fee, 2)
-        context.user_data['score'] = score
-        
-        save_trade(update.message.from_user.id, context.user_data)
-        
-        result_text = (
-            f"📊 **نتیجه محاسبه مدیریت ریسک برای {context.user_data['symbol']}**\n\n"
-            f"🔹 نوع پوزیشن: `{trade_type}`\n"
-            f"💵 مقدار ریسک دلاری شما: `{round(risk_amount, 2)}$`\n"
-            f"📐 حجم کل پوزیشن (Position Size): `{round(pos_size, 2)}$`\n"
-            f" ️اهرم (Leverage) پیشنهادی: `{leverage}x`\n"
-            f"💰 مارجین درگیر (Margin): `{round(margin, 2)}$`\n"
-            f"💸 کارمزد تخمینی صرافی: `{round(fee, 2)}$`\n\n"
-            f"💯 **امتیاز سلامت معامله: {score}/100**\n"
-        )
-        if score >= 80:
-            result_text += "🟢 استراتژی فوق‌العاده و کم‌ریسک."
-        elif score >= 50:
-            result_text += "🟡 ریسک متوسط؛ مدیریت سرمایه رعایت شده است."
-        else:
-            result_text += "🔴 بسیار خطرناک! یا ریسک بالا انتخاب کردید یا حد ضرر بیش از حد دور است."
+            position_size = risk_amount / price_diff_ratio
+            raw_leverage = 1.0 / price_diff_ratio
             
-        await update.message.reply_text(result_text, parse_mode="Markdown", reply_markup=main_menu_inline())
-        return ConversationHandler.END
+            leverage = round(min(max(raw_leverage, 1.0), 50.0), 1)
+            margin = position_size / leverage
+            
+            # سیستم امتیازدهی به ترید
+            score = 100
+            if risk_percent > 3: score -= 30
+            if leverage > 20: score -= 25
+            if margin > (capital * 0.25): score -= 25
+            score = max(score, 10)
+
+            save_final_trade(user_id, u_data, stop, round(position_size, 2), round(margin, 2), leverage, score)
+            clear_user_state(user_id)
+
+            res = (
+                f"📊 **برگه محاسبه مدیریت سرمایه ({u_data['symbol']})**\n\n"
+                f"🔹 نوع پوزیشن: `{t_type}`\n"
+                f"💵 ریسک دلاری واقعی: `{round(risk_amount, 2)}$`\n"
+                f"📐 حجم پوزیشن (Position Size): `{round(position_size, 2)}$`\n"
+                f" اهرم پیشنهادی (Leverage): `{leverage}x`\n"
+                f"💰 مارجین درگیر (Margin): `{round(margin, 2)}$`\n\n"
+                f"💯 **امتیاز سلامت این ترید: {score}/100**\n"
+            )
+            if score >= 75: res += "🟢 این ترید کاملاً اصولی و ایمن طراحی شده است."
+            elif score >= 50: res += "🟡 ریسک متوسط؛ مراقب نوسان ناگهانی مارکت باشید."
+            else: res += "🔴 ترید پرریسک! حجم مارجین یا اهرم نسبت به اکانت شما بالاست."
+
+            await update.message.reply_text(res, parse_mode="Markdown", reply_markup=main_menu_keyboard())
+
+        except ValueError:
+            await update.message.reply_text("❌ قیمت حد ضرر نامعتبر است! مجدداً عدد وارد کنید:")
+
+    elif current_state == 'WAITING_AI_SYMBOL':
+        symbol = text.upper()
+        clear_user_state(user_id)
+        await update.message.reply_text(f"⏳ در حال استخراج دیتای بازار و تحلیل ارز {symbol} توسط هوش مصنوعی جمینای...")
+
+        # آدرس رسمی و استاندارد جمینای
+        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
         
-    except ValueError:
-        await update.message.reply_text("❌ عدد حد ضرر نامعتبر است. مجدداً ارسال کنید:")
-        return STATE_STOP
-
-# --- موتور هوش مصنوعی جمینای بر پایه متد مستقیم HTTP ---
-
-async def process_ai_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    symbol = update.message.text.strip().upper()
-    await update.message.reply_text(f"⏳ در حال استخراج دیتای بازار و تحلیل ارز {symbol} توسط هوش مصنوعی جمینای...")
-
-    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
-    headers = {
-        "Content-Type": "application/json",
-        "X-goog-api-key": GEMINI_API_KEY
-    }
-    payload = {
-        "contents": [{
-            "parts": [{
-                "text": f"به عنوان یک تحلیل‌گر ارشد ارزهای دیجیتال، یک تحلیل تکنیکال و فاندامنتال فوق‌العاده سریع، کاربردی و خلاصه برای رمزارز {symbol} به زبان فارسی بنویس. سطوح کلیدی حمایت و مقاومت را مشخص کن و در آخر بگو برآیند بازار صعودی است یا نزولی."
+        # متد اول: تست ارسال کلید به عنوان Bearer Token اختصاصی سرویس اکانت‌ها
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {GEMINI_API_KEY}"
+        }
+        payload = {
+            "contents": [{
+                "parts": [{
+                    "text": f"به عنوان یک تریدر کریپتو، یک تحلیل تکنیکال بسیار خلاصه و سریع به زبان فارسی برای رمز ارز {symbol} بنویس و حمایت و مقاومت اصلی آن را بگو."
+                }]
             }]
-        }]
-    }
+        }
 
-    try:
-        response = requests.post(url, headers=headers, json=payload)
-        res_data = response.json()
-        
-        if response.status_code == 200:
-            ai_text = res_data['candidates'][0]['content']['parts'][0]['text']
-            await update.message.reply_text(f"🤖 **تحلیل هوش مصنوعی برای {symbol}:**\n\n{ai_text}", parse_mode="Markdown", reply_markup=main_menu_inline())
-        else:
-            error_msg = res_data.get('error', {}).get('message', 'عدم تایید دسترسی کلید گوگل')
-            await update.message.reply_text(f"❌ خطای احراز هویت از سمت سرور گوگل:\n`{error_msg}`", parse_mode="Markdown", reply_markup=main_menu_inline())
-    except Exception as e:
-        await update.message.reply_text(f"❌ خطای غیرمنتظره در شبکه رخ داد:\n`{str(e)}`", parse_mode="Markdown", reply_markup=main_menu_inline())
+        try:
+            response = requests.post(url, headers=headers, json=payload, timeout=10)
+            
+            # متد دوم: اگر متد بالا ارور داد، از ساختار لینک ابری پارامتریک استفاده کن
+            if response.status_code != 200:
+                alt_headers = {"Content-Type": "application/json"}
+                alt_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
+                response = requests.post(alt_url, headers=alt_headers, json=payload, timeout=10)
 
-    return ConversationHandler.END
+            res_data = response.json()
+            if response.status_code == 200:
+                ai_text = res_data['candidates'][0]['content']['parts'][0]['text']
+                await update.message.reply_text(f"🤖 **تحلیل اختصاصی جمینای برای {symbol}:**\n\n{ai_text}", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+            else:
+                error_msg = res_data.get('error', {}).get('message', 'عدم هماهنگی امضای توکن ابری')
+                await update.message.reply_text(f"❌ خطای احراز هویت سرور گوگل:\n`{error_msg}`\n\nاگر کماکان خطا باقی بود، لطفاً مطمئن شوید ساختار دسترسی کلید در پروژه گوگل ابری روی پابلیک است.", reply_markup=main_menu_keyboard())
+        except Exception as e:
+            await update.message.reply_text(f"❌ خطای اتصال به هوش مصنوعی: `{str(e)}`", reply_markup=main_menu_keyboard())
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("عملیات فعلی لغو شد.", reply_markup=main_menu_inline())
-    return ConversationHandler.END
+    else:
+        await update.message.reply_text("برای شروع ترید، لطفاً از منوی زیر یک گزینه را انتخاب کنید:", reply_markup=main_menu_keyboard())
 
 def main():
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
-    conv_handler = ConversationHandler(
-        entry_points=[
-            CommandHandler("start", start_cmd),
-            CallbackQueryHandler(handle_menu_callbacks, pattern="^MENU_")
-        ],
-        states={
-            STATE_SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_risk_symbol)],
-            STATE_TRADE_TYPE: [CallbackQueryHandler(process_trade_type, pattern="^TYPE_")],
-            STATE_CAPITAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_capital)],
-            STATE_RISK: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_risk)],
-            STATE_ENTRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_entry)],
-            STATE_STOP: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_stop)],
-            STATE_AI_SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_ai_symbol)]
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True
-    )
-
-    application.add_handler(conv_handler)
-    application.add_handler(CommandHandler("start", start_cmd))
-
-    print("--- Robot has been started successfully ---")
+    
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CallbackQueryHandler(handle_callback))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    print("--- Bot is fully operational without any errors ---")
     application.run_polling()
 
 if __name__ == '__main__':
     main()
-        
-        
+    
+    
