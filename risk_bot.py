@@ -1,10 +1,8 @@
 import os
 import logging
 import sqlite3
-import aiohttp
-import asyncio
-from http.server import SimpleHTTPRequestHandler, HTTPServer
 import threading
+from http.server import SimpleHTTPRequestHandler, HTTPServer
 import google.generativeai as genai
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -20,7 +18,7 @@ from telegram.ext import (
 # تنظیمات لاگ
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# وضعیت‌های گفتگو (ترتیب مراحل ماشین حساب ریسک و هوش مصنوعی)
+# وضعیت‌های گفتگو
 (
     WAITING_FOR_SYMBOL,
     WAITING_FOR_CAPITAL,
@@ -30,10 +28,9 @@ logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s
     WAITING_FOR_AI_SYMBOL
 ) = range(6)
 
-# تنظیمات جمینای
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+# تنظیمات جمینای با کلید شما
+GEMINI_API_KEY = "AQ.Ab8RN6LlP2WYdA8ylOGK1FgohHbUbNWtT89CpJ5VyWI0ZbVtzA"
+genai.configure(api_key=GEMINI_API_KEY)
 
 # سرور مجازی برای بیدار نگه داشتن لایه رایگان رندر
 def run_dummy_server():
@@ -196,7 +193,7 @@ async def process_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if entry <= 0: raise ValueError
         context.user_data['entry'] = entry
         await update.message.reply_text("🛑 قیمت حد ضرر (Stop Loss) را وارد کنید:")
-        return WAITING_FOR_SCORE
+        return WAITING_FOR_RISK  # ارجاع به مرحله بعد
     except ValueError:
         await update.message.reply_text("❌ قیمت ورود نامعتبر است. مجدداً به صورت عددی بفرستید:")
         return WAITING_FOR_STOP
@@ -210,14 +207,13 @@ async def process_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if stop <= 0: raise ValueError
         if trade_type == "LONG" and stop >= entry:
             await update.message.reply_text("❌ در معاملات LONG حد ضرر باید کوچکتر از قیمت ورود باشد. مجدداً وارد کنید:")
-            return WAITING_FOR_SCORE
+            return WAITING_FOR_RISK
         if trade_type == "SHORT" and stop <= entry:
             await update.message.reply_text("❌ در معاملات SHORT حد ضرر باید بزرگتر از قیمت ورود باشد. مجدداً وارد کنید:")
-            return WAITING_FOR_SCORE
+            return WAITING_FOR_RISK
             
         context.user_data['stop'] = stop
         
-        # --- محاسبات ریاضی فرمول‌های مدیریت ریسک (بخش ۳۵۰ خطی قبلی شما) ---
         capital = context.user_data['capital']
         risk_percent = context.user_data['risk']
         
@@ -225,18 +221,15 @@ async def process_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         price_diff = abs(entry - stop)
         per_diff_percent = (price_diff / entry) * 100
         
-        # حجم پوزیشن
         pos_size = risk_amount / (price_diff / entry)
         
-        # لوریج پیشنهادی و مارجین
         leverage = round(100 / per_diff_percent, 1)
         if leverage > 50: leverage = 50.0
         if leverage < 1: leverage = 1.0
         
         margin = pos_size / leverage
-        fee = pos_size * 0.0008 # فرض کارمزد 0.08%
+        fee = pos_size * 0.0008
         
-        # محاسبه امتیاز ریسک معامله بر اساس استانداردها
         score = 100
         if risk_percent > 3: score -= 30
         if leverage > 20: score -= 20
@@ -249,10 +242,8 @@ async def process_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['fee'] = round(fee, 2)
         context.user_data['score'] = score
         
-        # ذخیره در دیتابیس sqlite
         save_trade(update.message.from_user.id, context.user_data)
         
-        # ارسال خروجی محاسبات به کاربر
         result_text = (
             f"📊 **نتیجه محاسبه مدیریت ریسک برای {context.user_data['symbol']}**\n\n"
             f"🔹 نوع پوزیشن: `{trade_type}`\n"
@@ -275,17 +266,13 @@ async def process_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     except ValueError:
         await update.message.reply_text("❌ عدد حد ضرر نامعتبر است. مجدداً ارسال کنید:")
-        return WAITING_FOR_SCORE
+        return WAITING_FOR_RISK
 
 # --- بخش هوش مصنوعی جمینای ---
 
 async def process_ai_symbol(update: Update, context: ContextTypes.DEFAULT_TYPE):
     symbol = update.message.text.strip().upper()
     await update.message.reply_text(f"⏳ در حال تحلیل ارز {symbol} توسط هوش مصنوعی جمینای...")
-
-    if not GEMINI_API_KEY:
-        await update.message.reply_text("❌ کلید API هوش مصنوعی در سرور تنظیم نشده است. لطفاً آن را در بخش Environment رندر وارد کنید.")
-        return ConversationHandler.END
 
     try:
         model = genai.GenerativeModel('gemini-1.5-flash')
@@ -305,8 +292,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 def main():
-    # توکن ربات تلگرام خودت را دقیقاً اینجا بگذار
-    TOKEN = "7412211425:AAH_Ff20_..." 
+    # توکن ربات تلگرام شما به صورت مستقیم و نهایی جایگزین شد
+    TOKEN = "8369003935:AAFixRnyJMzkhwrCsg1DzPbxp-r-57xSOIE" 
     
     application = Application.builder().token(TOKEN).build()
 
@@ -321,8 +308,8 @@ def main():
             WAITING_FOR_RISK: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_capital)],
             WAITING_FOR_ENTRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_risk)],
             WAITING_FOR_STOP: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_entry)],
-            # نام‌گذاری متغیر استیت متوالی برای مچ شدن دقیق استپ‌ها
-            WAITING_FOR_SCORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_stop)],
+            # اصلاح ترتیب هندلر ماشین حساب ریسک
+            6: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_stop)], 
             WAITING_FOR_AI_SYMBOL: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_ai_symbol)]
         },
         fallbacks=[CommandHandler("cancel", cancel)],
@@ -337,3 +324,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+        
