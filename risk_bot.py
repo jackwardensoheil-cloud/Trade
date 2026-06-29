@@ -9,10 +9,10 @@ from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQu
 
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 
-# مشخصات نهایی و قطعی شما
+# مشخصات قطعی و تنظیم شده شما
 TELEGRAM_BOT_TOKEN = "8849903288:AAGK_XKMgCNbbC04r2IHFF1GyfF12uglIj8"
-# کلید جدید خود را که کپی کردی، دقیقاً بین دو کوتیشن زیر جایگزین کن:
-GEMINI_API_KEY = "کلید_جدید_شما_که_با_AIzaSy_شروع_میشود"
+# هر زمان کلید اصلی (شروع با AIzaSy) را گرفتی، آن را بین دو کوتیشن زیر بگذار:
+GEMINI_API_KEY = "YOUR_ACTUAL_AIZASY_KEY_HERE"
 
 def run_dummy_server():
     port = int(os.environ.get("PORT", 8080))
@@ -191,23 +191,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif current_state == 'WAITING_AI_SYMBOL':
         symbol = text.upper()
         clear_user_state(user_id)
-        await update.message.reply_text(f"⏳ در حال تحلیل ارز {symbol} توسط هوش مصنوعی...")
         
-        # آدرس مستقیم با متد استاندارد برای کلیدهای معمولی گوگل
+        if not GEMINI_API_KEY or GEMINI_API_KEY == "YOUR_ACTUAL_AIZASY_KEY_HERE" or not GEMINI_API_KEY.startswith("AIzaSy"):
+            await update.message.reply_text("⚠️ بخش هوش مصنوعی غیرفعال است.\nعلت: کلید وارد شده معتبر نیست یا با AIzaSy شروع نمی‌شود.\n\nاما نگران نباشید! بخش ماشین حساب و مدیریت ریسک کاملاً فعال است و می‌توانید از آن استفاده کنید.", reply_markup=main_menu_keyboard())
+            return
+
+        await update.message.reply_text(f"⏳ در حال تحلیل ارز {symbol} توسط هوش مصنوعی...")
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
         headers = {"Content-Type": "application/json"}
-        payload = {"contents": [{"parts": [{"text": f"به عنوان یک تریدر کریپتو، یک تحلیل تکنیکال بسیار خلاصه و سریع به زبان فارسی برای رمز ارز {symbol} بنویس و حمایت و مقاومت اصلی آن را بگو."}]}]}
+        payload = {"contents": [{"parts": [{"text": f"به عنوان یک تریدر کریپتو، یک تحلیل تکنیکال خلاصه به زبان فارسی برای رمز ارز {symbol} بنویس و حمایت و مقاومت اصلی آن را بگو."}]}]}
 
         try:
             response = requests.post(url, headers=headers, json=payload, timeout=10)
             res_data = response.json()
             if response.status_code == 200:
                 ai_text = res_data['candidates'][0]['content']['parts'][0]['text']
-                await update.message.reply_text(f"🤖 **تحلیل اختصاصی جمینای برای {symbol}:**\n\n{ai_text}", parse_mode="Markdown", reply_markup=main_menu_keyboard())
+                await update.message.reply_text(f"🤖 **تحلیل اختصاصی جمینای برای {symbol}:**\n\n{ai_text}", reply_markup=main_menu_keyboard())
             else:
-                await update.message.reply_text(f"❌ خطای سرور گوگل:\n`{res_data.get('error', {}).get('message', 'خطا')}`", reply_markup=main_menu_keyboard())
+                err_text = res_data.get('error', {}).get('message', 'API_KEY_INVALID')
+                await update.message.reply_text(f"⚠️ خطای سرور گوگل: `{err_text}`\n\nبخش محاسبات ریسک کماکان فعال است.", reply_markup=main_menu_keyboard())
         except Exception as e:
-            await update.message.reply_text(f"❌ خطای اتصال: `{str(e)}`", reply_markup=main_menu_keyboard())
+            await update.message.reply_text("⚠️ خطای ارتباطی با سرور گوگل. لطفاً بعداً تلاش کنید.", reply_markup=main_menu_keyboard())
     else:
         await update.message.reply_text("لطفاً از منوی زیر یک گزینه را انتخاب کنید:", reply_markup=main_menu_keyboard())
 
